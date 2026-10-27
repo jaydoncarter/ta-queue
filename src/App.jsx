@@ -17,6 +17,26 @@ function StatusBadge({ status }) {
   return <span className={`status status--${status}`}>{status === 'helping' ? 'Helping now' : 'Waiting'}</span>
 }
 
+function requestNotificationPermission() {
+  if (!('Notification' in window) || window.Notification.permission !== 'default') return
+  window.Notification.requestPermission().catch(() => {})
+}
+
+function notifyStudentJoined() {
+  if (!('Notification' in window) || window.Notification.permission !== 'granted') return
+  new window.Notification('Student joined the queue', {
+    body: 'The office-hours queue has a new request.',
+  })
+}
+
+async function getStudentSession() {
+  const { data: { session }, error: sessionError } = await supabase.auth.getSession()
+  if (sessionError || session) return { session, error: sessionError }
+
+  const { data, error } = await supabase.auth.signInAnonymously()
+  return { session: data.session, error }
+}
+
 function App() {
   const [entries, setEntries] = useState([])
   const [isLoading, setIsLoading] = useState(true)
@@ -33,9 +53,9 @@ function App() {
   const [now, setNow] = useState(null)
   const [onDutyTAs, setOnDutyTAs] = useState([])
 
-  const isSignedIn = Boolean(session?.user)
+  const canManageQueue = Boolean(session?.user && !session.user.is_anonymous)
   const userId = session?.user?.id
-  const queueCount = useMemo(() => entries.filter((entry) => entry.status === 'waiting').length, [entries])
+  const queueCount = useMemo(() => entries.length, [entries])
 
   async function loadEntries() {
     setIsLoading(true)
@@ -52,7 +72,10 @@ function App() {
     const initialLoad = window.setTimeout(() => { loadEntries() }, 0)
     const channel = supabase
       .channel('queue-entries-changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: QUEUE_TABLE }, loadEntries)
+      .on('postgres_changes', { event: '*', schema: 'public', table: QUEUE_TABLE }, (payload) => {
+        if (payload.eventType === 'INSERT') notifyStudentJoined()
+        loadEntries()
+      })
       .subscribe()
     return () => {
       window.clearTimeout(initialLoad)
@@ -76,6 +99,10 @@ function App() {
     const interval = window.setInterval(() => setNow(Date.now()), 30_000)
     return () => window.clearInterval(interval)
   }, [])
+
+  useEffect(() => {
+    document.title = `COMP 1010 TA Queue (${queueCount})`
+  }, [queueCount])
 
   useEffect(() => {
     const channel = supabase
@@ -102,7 +129,13 @@ function App() {
       setFormMessage({ type: 'error', text: 'Please enter your name and what you need help with.' })
       return
     }
+    requestNotificationPermission()
     setFormMessage(null)
+    const { session: studentSession, error: studentSessionError } = await getStudentSession()
+    if (studentSessionError || !studentSession?.user) {
+      setFormMessage({ type: 'error', text: studentSessionError?.message ?? 'Couldn’t create a student session. Please try again.' })
+      return
+    }
     const { error } = await supabase.from(QUEUE_TABLE).insert({ student_name: studentName, question: studentQuestion, status: 'waiting' })
     if (error) {
       setFormMessage({ type: 'error', text: `Couldn’t join the queue: ${error.message}` })
@@ -121,6 +154,7 @@ function App() {
       setAuthMessage({ type: 'error', text: 'Please enter the name students should see.' })
       return
     }
+    requestNotificationPermission()
     setAuthMessage(null)
     setIsSigningIn(true)
     const { error } = await supabase.auth.signInWithPassword({ email, password })
@@ -164,11 +198,28 @@ function App() {
     else loadEntries()
   }
 
+  async function removeOwnEntry(id) {
+    if (!userId) return
+
+    setActiveEntryId(id)
+    setFormMessage(null)
+    const { data, error } = await supabase.from(QUEUE_TABLE).delete().eq('id', id).eq('student_id', userId).select('id')
+    setActiveEntryId(null)
+    if (error) {
+      setFormMessage({ type: 'error', text: `Couldn’t leave the queue: ${error.message}` })
+    } else if (!data?.length) {
+      setFormMessage({ type: 'error', text: 'This entry could not be removed. It may already have been cleared.' })
+    } else {
+      setFormMessage({ type: 'success', text: 'You’ve been removed from the queue.' })
+      loadEntries()
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="site-header">
         <a className="brand" href="#top" aria-label="COMP 1010 TA Queue home"><h1>COMP 1010 TA Queue</h1></a>
-        <span className="queue-summary" aria-live="polite">{queueCount} {queueCount === 1 ? 'student' : 'students'} waiting</span>
+        <span className="queue-summary" aria-live="polite">{queueCount} {queueCount === 1 ? 'student' : 'students'} in queue</span>
       </header>
 
       <div id="top" className="intro">
@@ -198,9 +249,12 @@ function App() {
               <li className="queue-card" key={entry.id}>
                 <span className="queue-number" aria-label={`Queue number ${index + 1}`}>{String(index + 1).padStart(2, '0')}</span>
                 <div className="entry-copy"><div className="entry-meta"><h3>{entry.student_name}</h3><StatusBadge status={entry.status} /></div><p>{entry.question}</p>{entry.status === 'helping' && entry.ta_name && <p className="helper-name">Helping with <strong>{entry.ta_name}</strong></p>}<time dateTime={entry.created_at}>Waiting {elapsedTime(entry.created_at, now)}</time></div>
-                {isSignedIn && <div className="ta-actions" aria-label={`TA actions for ${entry.student_name}`}>
-                  {entry.status === 'waiting' ? <button type="button" className="button button--small button--dark" disabled={activeEntryId === entry.id || !taName.trim()} onClick={() => updateEntry(entry.id, { status: 'helping', ta_name: taName.trim() })}>Start helping</button> : <button type="button" className="button button--small button--outline" disabled={activeEntryId === entry.id} onClick={() => updateEntry(entry.id, { status: 'waiting', ta_name: null })}>Return to waiting</button>}
-                  <button type="button" className="text-button" disabled={activeEntryId === entry.id} onClick={() => removeEntry(entry.id)}>Remove</button>
+                {(canManageQueue || entry.student_id === userId) && <div className="ta-actions" aria-label={`Queue actions for ${entry.student_name}`}>
+                  {canManageQueue && <>
+                    {entry.status === 'waiting' ? <button type="button" className="button button--small button--dark" disabled={activeEntryId === entry.id || !taName.trim()} onClick={() => updateEntry(entry.id, { status: 'helping', ta_name: taName.trim() })}>Start helping</button> : <button type="button" className="button button--small button--outline" disabled={activeEntryId === entry.id} onClick={() => updateEntry(entry.id, { status: 'waiting', ta_name: null })}>Return to waiting</button>}
+                    <button type="button" className="text-button" disabled={activeEntryId === entry.id} onClick={() => removeEntry(entry.id)}>Remove</button>
+                  </>}
+                  {entry.student_id === userId && <button type="button" className="text-button" disabled={activeEntryId === entry.id} onClick={() => removeOwnEntry(entry.id)}>Remove myself</button>}
                 </div>}
               </li>
             ))}
@@ -210,7 +264,7 @@ function App() {
 
       <section className="ta-panel" aria-labelledby="ta-heading">
         <div><p className="eyebrow">For teaching assistants</p><h2 id="ta-heading">TA Sign In</h2><p className="ta-description">Sign in to take questions, return students to the queue, or clear completed requests.</p></div>
-        {isSignedIn ? <div className="signed-in"><p>Signed in as <strong>{session.user.email}</strong><br />Helping as <strong>{taName || 'add your name below'}</strong></p><label className="ta-name-field"><span>Your TA name</span><input value={taName} onChange={(event) => { setTaName(event.target.value); window.sessionStorage.setItem('ta-queue-ta-name', event.target.value) }} placeholder="e.g. Jaydon" maxLength="100" /></label><button type="button" className="button button--danger" onClick={handleSignOut}>Sign out</button></div> : <form className="sign-in-form" onSubmit={handleSignIn}><label><span>Your TA name</span><input value={taName} onChange={(event) => setTaName(event.target.value)} autoComplete="name" placeholder="e.g. Jaydon" maxLength="100" required /></label><label><span>Email</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required /></label><label><span>Password</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required /></label><button className="button button--dark" type="submit" disabled={isSigningIn}>{isSigningIn ? 'Signing in…' : 'Sign in'}</button></form>}
+        {canManageQueue ? <div className="signed-in"><p>Signed in as <strong>{session.user.email}</strong><br />Helping as <strong>{taName || 'add your name below'}</strong></p><label className="ta-name-field"><span>Your TA name</span><input value={taName} onChange={(event) => { setTaName(event.target.value); window.sessionStorage.setItem('ta-queue-ta-name', event.target.value) }} placeholder="e.g. Jaydon" maxLength="100" /></label><button type="button" className="button button--danger" onClick={handleSignOut}>Sign out</button></div> : <form className="sign-in-form" onSubmit={handleSignIn}><label><span>Your TA name</span><input value={taName} onChange={(event) => setTaName(event.target.value)} autoComplete="name" placeholder="e.g. Jaydon" maxLength="100" required /></label><label><span>Email</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required /></label><label><span>Password</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required /></label><button className="button button--dark" type="submit" disabled={isSigningIn}>{isSigningIn ? 'Signing in…' : 'Sign in'}</button></form>}
         {authMessage && <p className={`notice notice--${authMessage.type}`} role="status">{authMessage.text}</p>}
       </section>
 
